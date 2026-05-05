@@ -31,10 +31,12 @@ MOOD_VOCAB = ["hype", "dark", "chill", "melancholic", "groovy", "neutral"]
 # ---------------------------------------------------------------------------
 
 def extract_id(uri: str) -> str:
+    """Strips the Spotify URI prefix and returns the bare resource ID."""
     return uri.split(":")[-1]
 
 
 def load_json(path: str, default):
+    """Loads a JSON file from disk, returning `default` if the file does not exist."""
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
@@ -42,12 +44,14 @@ def load_json(path: str, default):
 
 
 def save_json(obj, path: str) -> None:
+    """Serializes `obj` to JSON at `path`, creating parent directories as needed."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(obj, f)
 
 
 def init_spotify() -> spotipy.Spotify:
+    """Initializes and returns an authenticated Spotify client using credentials from the environment."""
     client_id = os.getenv("SPOTIPY_CLIENT_ID")
     client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
     if not client_id or not client_secret:
@@ -61,6 +65,7 @@ def init_spotify() -> spotipy.Spotify:
 # ---------------------------------------------------------------------------
 
 def load_slices(slices_dir: str, limit: int) -> list:
+    """Reads MPD slice JSON files in sorted order and returns up to `limit` playlists with at least 5 tracks."""
     paths = sorted(glob(os.path.join(slices_dir, "*.json")))
     playlists = []
     for path in paths:
@@ -83,6 +88,7 @@ def load_slices(slices_dir: str, limit: int) -> list:
 # ---------------------------------------------------------------------------
 
 def _retry_sleep(exc) -> None:
+    """Reads the Retry-After header from a 429 exception and sleeps for that many seconds."""
     retry_after = 5
     if hasattr(exc, "headers") and exc.headers and "Retry-After" in exc.headers:
         try:
@@ -94,6 +100,7 @@ def _retry_sleep(exc) -> None:
 
 
 def fetch_audio_features(sp: spotipy.Spotify, track_ids: set, cache: dict) -> None:
+    """Fetches Spotify audio features for all uncached track IDs in batches of 100, writing results into `cache`."""
     missing = [tid for tid in track_ids if tid not in cache]
     if not missing:
         return
@@ -129,6 +136,7 @@ def fetch_audio_features(sp: spotipy.Spotify, track_ids: set, cache: dict) -> No
 
 
 def fetch_artist_genres(sp: spotipy.Spotify, artist_ids: set, cache: dict) -> None:
+    """Fetches genre tags for all uncached artist IDs in batches of 50, writing results into `cache`."""
     missing = [aid for aid in artist_ids if aid not in cache]
     if not missing:
         return
@@ -160,6 +168,7 @@ def fetch_artist_genres(sp: spotipy.Spotify, artist_ids: set, cache: dict) -> No
 # ---------------------------------------------------------------------------
 
 def derive_mood(energy: float, valence: float, danceability: float) -> str:
+    """Maps average energy, valence, and danceability values to one of six mood labels."""
     if energy > 0.7 and valence > 0.6:
         return "hype"
     if energy > 0.7 and valence <= 0.4:
@@ -178,6 +187,7 @@ def derive_mood(energy: float, valence: float, danceability: float) -> str:
 # ---------------------------------------------------------------------------
 
 def build_partial_entry(raw: dict, audio_cache: dict, genre_cache: dict) -> dict | None:
+    """Converts a raw MPD playlist into a partial DB entry with a 5-dim base vector, dominant genre, and mood; returns None if fewer than 5 tracks have audio features."""
     track_ids = []
     track_features = {}
     artist_ids = []
@@ -230,6 +240,7 @@ def build_partial_entry(raw: dict, audio_cache: dict, genre_cache: dict) -> dict
 # ---------------------------------------------------------------------------
 
 def build_genre_vocab(partials: list) -> dict:
+    """Builds a sorted genre-to-float mapping so each unique genre gets a consistent position in [0, 1]."""
     genres = sorted({p["dominant_genre"] for p in partials if p["dominant_genre"]})
     if not genres:
         return {}
@@ -237,6 +248,7 @@ def build_genre_vocab(partials: list) -> dict:
 
 
 def build_mood_vocab() -> dict:
+    """Returns a fixed mood-to-float mapping over the six known mood labels."""
     n = len(MOOD_VOCAB)
     return {m: i / max(n - 1, 1) for i, m in enumerate(MOOD_VOCAB)}
 
@@ -246,6 +258,7 @@ def build_mood_vocab() -> dict:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Orchestrates the full pipeline: load slices → fetch API data → build entries → write playlists.json."""
     parser = argparse.ArgumentParser(description="Build VibeSearch playlist database from MPD slices.")
     parser.add_argument("--limit", type=int, default=1000, help="Max playlists to index (default 1000)")
     parser.add_argument("--slices-dir", default="data/slices", help="Path to MPD slice directory")
