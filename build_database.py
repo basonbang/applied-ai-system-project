@@ -15,6 +15,7 @@ from collections import Counter
 from glob import glob
 
 import numpy as np
+import requests
 import spotipy
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -23,7 +24,11 @@ load_dotenv()
 
 AUDIO_CACHE_PATH = "data/cache/audio_features.json"
 GENRE_CACHE_PATH = "data/cache/artist_genres.json"
+UUID_CACHE_PATH = "data/cache/rb_uuids.json"
 MOOD_VOCAB = ["hype", "dark", "chill", "melancholic", "groovy", "neutral"]
+RB_API_BASE = "https://api.reccobeats.com"
+RB_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; VibeSearch/1.0)"}
+RB_BATCH_SIZE = 40  # hard limit enforced by ReccoBeats on both /v1/track and /v1/audio-features
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +73,8 @@ def load_slices(slices_dir: str, limit: int) -> list:
     """Reads MPD slice JSON files in sorted order and returns up to `limit` playlists with at least 5 tracks."""
     paths = sorted(glob(os.path.join(slices_dir, "*.json")))
     playlists = []
+    
+    # Open each slice file, skipping the invalid or corrupted ones
     for path in paths:
         try:
             with open(path) as f:
@@ -75,9 +82,13 @@ def load_slices(slices_dir: str, limit: int) -> list:
         except (json.JSONDecodeError, OSError) as e:
             print(f"  [skip] {path}: {e}")
             continue
+
+        # Extract the playlists from the slice, filtering out those with less than 5 songs
         for pl in data.get("playlists", []):
             if pl.get("num_tracks", 0) >= 5:
                 playlists.append(pl)
+
+                # Stop extracting once we reach the limit 
                 if len(playlists) >= limit:
                     return playlists
     return playlists
@@ -89,7 +100,8 @@ def load_slices(slices_dir: str, limit: int) -> list:
 
 def _retry_sleep(exc) -> None:
     """Reads the Retry-After header from a 429 exception and sleeps for that many seconds."""
-    retry_after = 5
+    retry_after = 5 # default fallback to 5 seconds
+
     if hasattr(exc, "headers") and exc.headers and "Retry-After" in exc.headers:
         try:
             retry_after = int(exc.headers["Retry-After"])
@@ -99,38 +111,62 @@ def _retry_sleep(exc) -> None:
     time.sleep(retry_after)
 
 
-def fetch_audio_features(sp: spotipy.Spotify, track_ids: set, cache: dict) -> None:
-    """Fetches Spotify audio features for all uncached track IDs in batches of 100, writing results into `cache`."""
-    missing = [tid for tid in track_ids if tid not in cache]
+# ---------------------------------------------------------------------------
+# ReccoBeats API fetches (audio features — Spotify endpoint deprecated Nov 2024)
+# ---------------------------------------------------------------------------
+
+def resolve_rb_uuids(spotify_ids: list, uuid_cache: dict) -> None:
+    """Resolves uncached Spotify track IDs to ReccoBeats internal UUIDs via /v1/track?ids=, writing into `uuid_cache`."""
+    missing = [sid for sid in spotify_ids if sid not in uuid_cache]
+    if not missing:
+        return
+    print(f"  Resolving {len(missing)} Spotify IDs → ReccoBeats UUIDs …")
+    for i in range(0, len(missing), RB_BATCH_SIZE):
+        batch = missing[i : i + RB_BATCH_SIZE]
+        resp = requests.get(f"{RB_API_BASE}/v1/track?ids={','.join(batch)}", headers=RB_HEADERS, timeout=30)
+        resp.raise_for_status()
+        for track in resp.json().get("content", []):
+            # Match returned tracks back to their Spotify ID via the href field
+            spotify_id = track.get("href", "").split("/")[-1]
+            if spotify_id:
+                uuid_cache[spotify_id] = track["id"]
+        if (i // RB_BATCH_SIZE) % 10 == 9:
+            save_json(uuid_cache, UUID_CACHE_PATH)
+            print(f"    … resolved {i + len(batch)}/{len(missing)}")
+        time.sleep(0.05)
+
+
+def fetch_audio_features(track_ids: set, uuid_cache: dict, audio_cache: dict) -> None:
+    """Fetches audio features from ReccoBeats for all uncached track IDs in batches of 100, writing results into `audio_cache`."""
+    missing = [tid for tid in track_ids if tid not in audio_cache and tid in uuid_cache]
     if not missing:
         return
     print(f"  Fetching audio features for {len(missing)} tracks …")
-    batch_size = 100
-    for i in range(0, len(missing), batch_size):
-        batch = missing[i : i + batch_size]
-        while True:
-            try:
-                results = sp.audio_features(batch)
-                break
-            except spotipy.exceptions.SpotifyException as e:
-                if e.http_status == 429:
-                    _retry_sleep(e)
-                else:
-                    raise
-        for item in results:
-            if item is None:
+    for i in range(0, len(missing), RB_BATCH_SIZE):
+        batch = missing[i : i + RB_BATCH_SIZE]
+        uuids = [uuid_cache[tid] for tid in batch]
+        resp = requests.get(f"{RB_API_BASE}/v1/audio-features?ids={','.join(uuids)}", headers=RB_HEADERS, timeout=30)
+        resp.raise_for_status()
+        for item in resp.json().get("content", []):
+            # Map ReccoBeats UUID back to Spotify ID via the href field
+            spotify_id = item.get("href", "").split("/")[-1]
+            if not spotify_id:
                 continue
-            tid = item["id"]
-            tempo_norm = min(item["tempo"] / 200.0, 1.0)
-            cache[tid] = [
+            # Skip tracks where any required field is null
+            required = ["energy", "danceability", "valence", "acousticness", "tempo"]
+            if any(item.get(k) is None for k in required):
+                continue
+            tempo_norm = min(item["tempo"] / 200.0, 1.0)    # normalize tempo to [0,1] assuming 200 BPM max
+            audio_cache[spotify_id] = [
                 item["energy"],
                 item["danceability"],
                 item["valence"],
                 item["acousticness"],
                 tempo_norm,
             ]
-        if (i // batch_size) % 10 == 9:
-            save_json(cache, AUDIO_CACHE_PATH)
+        # Save the cache to disk every 10 batches to avoid losing progress
+        if (i // RB_BATCH_SIZE) % 10 == 9:
+            save_json(audio_cache, AUDIO_CACHE_PATH)
             print(f"    … cached {i + len(batch)}/{len(missing)}")
         time.sleep(0.05)
 
@@ -146,6 +182,7 @@ def fetch_artist_genres(sp: spotipy.Spotify, artist_ids: set, cache: dict) -> No
         batch = missing[i : i + batch_size]
         while True:
             try:
+                # Calls Spotify API to fetch artist information such as genre tags for a batch of artists
                 results = sp.artists(batch)
                 break
             except spotipy.exceptions.SpotifyException as e:
@@ -153,10 +190,13 @@ def fetch_artist_genres(sp: spotipy.Spotify, artist_ids: set, cache: dict) -> No
                     _retry_sleep(e)
                 else:
                     raise
+        
         for artist in results.get("artists") or []:
             if artist is None:
                 continue
+            # Saves artist's genre list in the cache, using their ID as the key
             cache[artist["id"]] = artist.get("genres", [])
+        # Save the cache to disk every 20 batches to avoid losing progress
         if (i // batch_size) % 20 == 19:
             save_json(cache, GENRE_CACHE_PATH)
             print(f"    … cached {i + len(batch)}/{len(missing)}")
@@ -192,20 +232,24 @@ def build_partial_entry(raw: dict, audio_cache: dict, genre_cache: dict) -> dict
     track_features = {}
     artist_ids = []
 
-    for t in raw.get("tracks", []):
-        tid = extract_id(t.get("track_uri", ""))
-        aid = extract_id(t.get("artist_uri", ""))
+    # For each raw track from the MPD slice, extract the track and artist ID  
+    for track in raw.get("tracks", []):
+        tid = extract_id(track.get("track_uri", ""))
+        aid = extract_id(track.get("artist_uri", ""))
         if not tid:
             continue
+        # Only include this raw track if we have audio features for it in the cache
         if tid in audio_cache:
             track_ids.append(tid)
             track_features[tid] = audio_cache[tid]
+        # Collect artist IDs for genre majority vote
         if aid:
             artist_ids.append(aid)
 
     if len(track_ids) < 5:
         return None
 
+    # Compute the playlist's base vector as the average of its tracks' audio features
     vectors = np.array([track_features[tid] for tid in track_ids])
     base_vector = vectors.mean(axis=0).tolist()  # 5-dim
 
@@ -216,6 +260,7 @@ def build_partial_entry(raw: dict, audio_cache: dict, genre_cache: dict) -> dict
             genre_counter[g] += 1
     dominant_genre = genre_counter.most_common(1)[0][0] if genre_counter else None
 
+    # dominant_mood: derived from the average energy, valence, and danceability of the playlist's tracks
     avg_energy = base_vector[0]
     avg_valence = base_vector[2]
     avg_dance = base_vector[1]
@@ -272,10 +317,8 @@ def main() -> None:
     print(f"  output     : {args.output}")
     print()
 
-    sp = init_spotify()
-
     audio_cache: dict = load_json(AUDIO_CACHE_PATH, {})
-    genre_cache: dict = load_json(GENRE_CACHE_PATH, {})
+    uuid_cache: dict = load_json(UUID_CACHE_PATH, {})
 
     print(f"[1/5] Loading slices …")
     raw_playlists = load_slices(args.slices_dir, args.limit)
@@ -294,21 +337,22 @@ def main() -> None:
     print(f"  Unique tracks : {len(all_track_ids)}")
     print(f"  Unique artists: {len(all_artist_ids)}")
 
-    print(f"\n[2/5] Fetching audio features …")
-    fetch_audio_features(sp, all_track_ids, audio_cache)
+    print(f"\n[2/5] Fetching audio features (via ReccoBeats) …")
+    resolve_rb_uuids(list(all_track_ids), uuid_cache)
+    save_json(uuid_cache, UUID_CACHE_PATH)
+    print(f"  UUID cache size: {len(uuid_cache)}")
+    fetch_audio_features(all_track_ids, uuid_cache, audio_cache)
     save_json(audio_cache, AUDIO_CACHE_PATH)
     print(f"  Audio cache size: {len(audio_cache)}")
 
-    print(f"\n[3/5] Fetching artist genres …")
-    fetch_artist_genres(sp, all_artist_ids, genre_cache)
-    save_json(genre_cache, GENRE_CACHE_PATH)
-    print(f"  Genre cache size: {len(genre_cache)}")
+    print(f"\n[3/5] Skipping artist genres (Spotify /v1/artists returns 403 for new apps) …")
+    print(f"  dominant_genre will be null; genre_centroid defaults to 0.5")
 
     print(f"\n[4/5] Building playlist entries …")
     partials = []
     skipped = 0
     for raw in raw_playlists:
-        entry = build_partial_entry(raw, audio_cache, genre_cache)
+        entry = build_partial_entry(raw, audio_cache, {})
         if entry:
             partials.append(entry)
         else:
@@ -321,9 +365,12 @@ def main() -> None:
 
     db = []
     for p in partials:
+        # Creates the final 7-dim feature vector
         genre_centroid = genre_vocab.get(p["dominant_genre"], 0.5)
         mood_centroid = mood_vocab.get(p["dominant_mood"], 0.5)
         feature_vector = p["_base_vector"] + [genre_centroid, mood_centroid]
+
+        # Final playlist entry written into playlists.json
         db.append({
             "id": p["id"],
             "name": p["name"],
