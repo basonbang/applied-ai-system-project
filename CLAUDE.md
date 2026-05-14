@@ -17,7 +17,7 @@ explained by audio features.
 # Install dependencies
 pip install -r requirements.txt
 
-# Build the playlist database (one-time setup — requires Spotify API credentials)
+# Build the playlist database (one-time setup — requires Last.fm API key)
 python build_database.py
 
 # Run the Streamlit app
@@ -40,12 +40,11 @@ PYTHONPATH=legacy python3 -m pytest legacy/tests/
 All API keys live in a `.env` file at the project root (git-ignored). Required variables:
 
 ```
-SPOTIPY_CLIENT_ID=...
-SPOTIPY_CLIENT_SECRET=...
+LASTFM_API_KEY=...
 GEMINI_API_KEY=...
 ```
 
-- Spotify credentials: [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+- Last.fm API key: [last.fm/api/account/create](https://www.last.fm/api/account/create) (free)
 - Gemini API key: [Google AI Studio](https://aistudio.google.com) (free tier, no credit card)
 
 ---
@@ -54,8 +53,8 @@ GEMINI_API_KEY=...
 
 ```
 applied-ai-system-final/
-├── app.py                 — Streamlit UI 
-├── build_database.py      — One-time script: source playlists → Spotify audio features → data/playlists.json
+├── app.py                 — Streamlit UI
+├── build_database.py      — One-time script: MPD slices → ReccoBeats audio features + Last.fm genres → data/playlists.json
 ├── evaluate.py            — Test harness: 5–10 preset inputs, pass/fail summary
 ├── .env                   — API credentials (git-ignored)
 ├── requirements.txt
@@ -64,7 +63,17 @@ applied-ai-system-final/
 │   ├── agent.py           — Gemini Flash vibe clarification agent + explanation generator
 │   └── scoring.py         — Hybrid scorer with mode-specific weight configs
 ├── data/
-│   └── playlists.json     — Indexed playlist database (output of build_database.py)
+│   ├── playlists.json     — Indexed playlist database (output of build_database.py)
+│   └── cache/
+│       ├── audio_features.json  — ReccoBeats audio feature vectors keyed by Spotify track ID
+│       ├── rb_uuids.json        — Spotify track ID → ReccoBeats UUID mappings
+│       └── artist_genres.json   — Last.fm genre tags keyed by lowercased artist name
+├── docs/
+│   ├── VibeSearch_PRD_v2.md     — Product requirements document
+│   ├── build_database_flow.md   — Build pipeline documentation
+│   ├── model_card.md            — Model card
+│   └── reflection.md            — Project reflection
+├── screenshots/           — UI screenshots
 └── legacy/                — Original CSV-based song recommender (untouched, for reference)
     ├── src/
     ├── data/
@@ -77,16 +86,16 @@ applied-ai-system-final/
 
 ```
 Streamlit UI (app.py)
-  Tab 1: Playlist URL  |  Tab 2: Describe Your Vibe  |  Tab 3: Reference Song
+  Tab 1: Playlist URL  |  Tab 2: Vibe Chat  |  Tab 3: Reference Song
               │                   │                      │
               └───────────────────┼──────────────────────┘
                                   │
                           Input Router
                          /              \
-              Spotify API             Gemini Flash Agent
-              (spotipy)               (vibe clarification,
-              Fetch audio             2–3 follow-up questions,
-              features                outputs interpreted targets)
+              ReccoBeats API          Gemini Flash Agent
+              (audio features)        (vibe clarification,
+              + spotipy track         2–3 follow-up questions,
+              metadata                outputs interpreted targets)
                          \              /
                      Query Constructor
                      Normalized NumPy feature vector
@@ -116,8 +125,9 @@ Streamlit UI (app.py)
 
 ## Data Flow
 
-1. **Input resolution** — Playlist URL or song URL is fetched via Spotify API into a feature vector.
-   Vibe text goes through the Gemini clarification agent first, producing a feature target dict.
+1. **Input resolution** — Playlist URL or song URL is resolved into a feature vector using track
+   metadata and ReccoBeats audio features. Vibe text goes through the Gemini clarification agent
+   first, producing a feature target dict.
 2. **Query vector construction** — All inputs normalize to a 7-dim NumPy vector.
 3. **Retrieval** — `src/retrieval.py` runs fallback retrieval against `data/playlists.json`.
 4. **Hybrid scoring** — `src/scoring.py` combines available signals with mode-specific weights.
@@ -132,7 +142,7 @@ Streamlit UI (app.py)
 | File | Purpose |
 |---|---|
 | `app.py` | Streamlit UI; owns tab routing and result rendering |
-| `build_database.py` | One-time builder: reads source playlist IDs → Spotify audio features → writes `data/playlists.json` |
+| `build_database.py` | One-time builder: reads MPD slices → ReccoBeats audio features → Last.fm genre tags → writes `data/playlists.json` |
 | `evaluate.py` | Headless test harness; runs 5–10 preset inputs across all 3 modes, prints pass/fail |
 | `src/retrieval.py` | Fallback retrieval (L1 containment, L2 track similarity, L3 vibe cosine); loads and caches DB |
 | `src/agent.py` | Gemini Flash client; multi-turn vibe clarification loop + explanation generation |
@@ -184,12 +194,12 @@ Each entry in the JSON array:
 
 ```json
 {
-  "id": "spotify_playlist_id",
+  "id": "1000",
   "name": "Playlist Name",
-  "url": "https://open.spotify.com/playlist/...",
+  "url": null,
   "track_count": 24,
-  "description": "Optional playlist description",
-  "dominant_genre": "lofi",
+  "description": null,
+  "dominant_genre": "indie rock",
   "dominant_mood": "chill",
   "feature_vector": [0.61, 0.72, 0.45, 0.38, 0.80, 0.55, 0.49],
   "feature_labels": ["energy", "danceability", "valence", "acousticness", "tempo_norm", "genre_centroid", "mood_centroid"],
@@ -201,18 +211,34 @@ Each entry in the JSON array:
 }
 ```
 
+Notes:
+- `id` — MPD playlist pid (integer serialized as string)
+- `url` / `description` — always `null` for MPD-sourced playlists
+- `dominant_genre` — top genre tag from Last.fm `artist.getTopTags`, majority-voted across all artists in the playlist; `null` if no artists had a recognized genre tag
+- `dominant_mood` — derived from average energy, valence, and danceability via a fixed mapping to one of: `hype`, `dark`, `chill`, `melancholic`, `groovy`, `neutral`
+- `feature_vector` — 7-dim: 5 audio dims (ReccoBeats) + `genre_centroid` (sorted vocab position) + `mood_centroid` (fixed vocab position)
+
 `track_ids` → L1 exact containment. `track_features` → L2 track similarity. `feature_vector` → L3 vibe match and all input modes.
 
 ---
 
 ## Building the Database
 
-`build_database.py` is a one-time setup script. Two supported source approaches:
+`build_database.py` is a one-time setup script. It reads MPD slice JSON files from `data/slices/`
+and enriches each playlist through a two-stage API pipeline:
 
-1. **MPD slice** — Download a slice of the [Spotify Million Playlist Dataset](https://www.aicrowd.com/challenges/spotify-million-playlist-dataset-challenge), point the script at the JSON files, and it will enrich each playlist with Spotify audio features.
-2. **Manual curation** — Provide a text file of Spotify playlist URLs (one per line). The script fetches each playlist's tracks and their audio features via the Spotify API.
+1. **Audio features (ReccoBeats)** — Spotify track IDs are resolved to ReccoBeats internal UUIDs
+   via `/v1/track`, then 5-dim audio features (energy, danceability, valence, acousticness, tempo)
+   are fetched in batches of 40 via `/v1/audio-features`. No API key required. Results cached to
+   `data/cache/rb_uuids.json` and `data/cache/audio_features.json`.
 
-Output is always `data/playlists.json`. Expect ~500–1000 playlists for meaningful retrieval. The file can be large; consider adding it to `.gitignore`.
+2. **Genre tags (Last.fm)** — Artist names (from MPD slice data) are looked up via
+   `artist.getTopTags`. The top tag that appears in `GENRE_ALLOWLIST` with a vote count ≥ 5 is
+   stored as the dominant genre. Results cached to `data/cache/artist_genres.json`. Requires
+   `LASTFM_API_KEY` in `.env`.
+
+Output is always `data/playlists.json`. Expect ~500–1000 playlists for meaningful retrieval.
+All three cache files persist between runs so reruns only fetch uncached entries.
 
 ---
 
@@ -232,20 +258,28 @@ Prints: inputs tested, pass/fail per case, overall pass rate.
 
 | Edge case | Handling |
 |---|---|
-| Malformed Spotify URL | Validate before API call; surface clear UI error |
+| Malformed URL input | Validate before API call; surface clear UI error |
 | Private/unavailable playlist | Surface error; suggest vibe or song mode |
 | Playlist with < 5 tracks | Flag as low-confidence input; warn in UI |
 | Song not in any indexed playlist | Skip L1; run L2 → L3; label result as fallback |
 | Vague or contradictory vibe | Agent surfaces contradiction and asks user to prioritize |
 | No strong match in database | Return closest results with Low confidence label |
-| Spotify API unavailable | Catch exception; offer fallback to vibe description mode |
 | Missing audio features for a track | Skip track in vector construction; log dropped tracks |
+| Artist not found on Last.fm | `dominant_genre` is null; `genre_centroid` defaults to 0.5 |
 
 ---
 
-## Legacy Code
+## Sprint Plan
 
-The original CSV-based song recommender lives in `legacy/` and is not part of the VibeSearch
-pipeline. It uses a different scoring approach (weighted proximity over a 20-song CSV catalog) and
-is kept for reference and grading continuity. See `legacy/src/recommender.py` for the original
-`Recommender` class, `score_song()`, and `recommend_songs()` implementations.
+Remaining work to ship VibeSearch is broken into 7 phases, each with small incremental tasks
+ordered by dependency. See [docs/sprint_plan.md](docs/sprint_plan.md) for the full breakdown.
+
+| Phase | Scope | Files |
+|---|---|---|
+| 1 | Retrieval primitives (cosine, DB loader, L3 similarity) | `src/retrieval.py`, `src/scoring.py` |
+| 2 | Gemini vibe agent (interpret, clarify, explain) | `src/agent.py` |
+| 3 | Vibe mode end-to-end | `src/retrieval.py`, `app.py` |
+| 4 | Playlist URL mode | `src/retrieval.py` |
+| 5 | Reference song mode (L1 → L2 → L3 cascade) | `src/retrieval.py` |
+| 6 | Evaluation harness | `evaluate.py` |
+| 7 | Polish (error handling, prompt tuning, docs) | various |
